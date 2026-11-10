@@ -1086,6 +1086,17 @@ func (gs *GossipSubRouter) handleGraft(p peer.ID, ctl *pb.ControlMessage) []*pb.
 			continue
 		}
 
+		// A peer can still send us a GRAFT on its stream to us while we have no
+		// stream to it, for example while its writer is respawned or after the
+		// dead-peer backoff gave up. We could not send it anything, so keep it
+		// out of the mesh; the heartbeat grafts it once it has a writer again.
+		// No PRUNE either, as it could not be sent.
+		if _, ok := gs.peers[p]; !ok {
+			gs.logger.Debug("GRAFT: ignoring peer without an outbound stream", "peer", p, "topic", topic)
+			doPX = false
+			continue
+		}
+
 		// we don't GRAFT to/from direct peers; complain loudly if this happens
 		_, direct := gs.direct[p]
 		if direct {

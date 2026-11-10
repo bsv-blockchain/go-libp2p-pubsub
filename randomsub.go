@@ -120,6 +120,12 @@ func (rs *RandomSubRouter) Publish(msg *Message) {
 			continue
 		}
 
+		// Skip subscribed peers we have no writer to, so they do not take
+		// sample slots from peers that can receive the message.
+		if _, ok := rs.p.peers[p]; !ok {
+			continue
+		}
+
 		if rs.peers[p] == FloodSubID {
 			tosend[p] = struct{}{}
 		} else {

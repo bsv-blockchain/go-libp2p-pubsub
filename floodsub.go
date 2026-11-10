@@ -64,7 +64,15 @@ func (fs *FloodSubRouter) EnoughPeers(topic string, suggested int) bool {
 		suggested = FloodSubTopicSearchSize
 	}
 
-	if len(tmap) >= suggested {
+	// A subscribed peer we have no writer to cannot receive anything.
+	n := 0
+	for p := range tmap {
+		if _, ok := fs.p.peers[p]; ok {
+			n++
+		}
+	}
+
+	if n >= suggested {
 		return true
 	}
 
