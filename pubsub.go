@@ -138,7 +138,7 @@ type PubSub struct {
 	peerDead       chan struct{}
 	peerDeadPrioLk sync.RWMutex
 	peerDeadMx     sync.Mutex
-	peerDeadPend   map[peer.ID]struct{}
+	peerDeadPend   map[peer.ID]network.Conn // connection the dead outbound stream was on
 	// backoff for retrying new connections to dead peers
 	deadPeerBackoff *backoff
 
@@ -639,7 +639,7 @@ func NewPubSub(ctx context.Context, h host.Host, rt PubSubRouter, opts ...Option
 		newPeerStream:         make(chan peerOutgoingStream),
 		newPeerError:          make(chan peer.ID),
 		peerDead:              make(chan struct{}, 1),
-		peerDeadPend:          make(map[peer.ID]struct{}),
+		peerDeadPend:          make(map[peer.ID]network.Conn),
 		deadPeerBackoff:       newBackoff(ctx, 1000, BackoffCleanupInterval, MaxBackoffAttempts),
 		cancelCh:              make(chan *Subscription),
 		getPeers:              make(chan *listPeerReq),
@@ -1071,11 +1071,13 @@ func (p *PubSub) processLoop(ctx context.Context) {
 			p.logger.Info("Blacklisting peer", "peer", pid)
 			p.blacklist.Add(pid)
 
+			// A peer can be subscribed without a writer, for example while it
+			// is being respawned, so its subscriptions are cleared either way.
+			p.clearPeerFromTopicsState(pid)
 			q, ok := p.peers[pid]
 			if ok {
 				q.Close()
 				delete(p.peers, pid)
-				p.clearPeerFromTopicsState(pid)
 				p.rt.OnClosedOutboundStream(pid)
 			}
 
@@ -1149,10 +1151,10 @@ func (p *PubSub) handleDeadPeers() {
 	}
 
 	deadPeers := p.peerDeadPend
-	p.peerDeadPend = make(map[peer.ID]struct{})
+	p.peerDeadPend = make(map[peer.ID]network.Conn)
 	p.peerDeadPrioLk.Unlock()
 
-	for pid := range deadPeers {
+	for pid, deadConn := range deadPeers {
 		q, ok := p.peers[pid]
 		if !ok {
 			continue
@@ -1161,23 +1163,41 @@ func (p *PubSub) handleDeadPeers() {
 		q.Close()
 		delete(p.peers, pid)
 
-		p.clearPeerFromTopicsState(pid)
 		p.rt.OnClosedOutboundStream(pid)
 
 		if p.host.Network().Connectedness(pid) == network.Connected {
-			backoffDelay, err := p.deadPeerBackoff.updateAndGet(pid)
+			// Still connected: a duplicate connection was closed, or the peer
+			// reset our stream. The peer's subscriptions are kept, because it
+			// announced them on its own stream to us and will not announce them
+			// again; they are cleared when that stream closes.
+			//
+			// The backoff guards against a peer that keeps resetting our stream
+			// on a live connection, and allows only MaxBackoffAttempts respawns
+			// per TimeToLive before giving up on the writer. A stream that died
+			// with its connection while another connection remains is not that:
+			// a duplicate connection went away (e.g. the old process of a peer
+			// restarted with a fixed identity). Respawn at once without charging
+			// the backoff, or a peer restarted that often would be left without
+			// a writer while still connected and subscribed.
+			var backoffDelay time.Duration
+			var err error
+			if deadConn == nil || !deadConn.IsClosed() {
+				backoffDelay, err = p.deadPeerBackoff.updateAndGet(pid)
+			}
 			if err != nil {
 				p.logger.Debug("error updating backoff", "err", err, "peer", pid)
 				continue
 			}
 
-			// still connected, must be a duplicate connection being closed.
-			// we respawn the writer as we need to ensure there is a stream active
+			// Respawn the writer so there is a stream to the peer.
 			p.logger.Debug("peer declared dead but still connected; respawning writer", "peer", pid)
 			rpcQueue := newRpcQueue(p.peerOutboundQueueSize)
 			p.peers[pid] = rpcQueue
 			go p.handleNewPeerWithBackoff(p.ctx, pid, backoffDelay, rpcQueue)
+			continue
 		}
+
+		p.clearPeerFromTopicsState(pid)
 	}
 }
 
